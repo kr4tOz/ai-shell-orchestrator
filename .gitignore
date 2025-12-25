@@ -1,0 +1,13 @@
+# logs / state
+*.log
+*.sqlite
+*.db
+*.bak
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# temp
+tmp/

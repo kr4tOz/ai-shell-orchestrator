@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# IA local helper (ai)
+# - loop persistente
+# - executor con allowlist (/do)
+# - memoria sqlite (/remember /mem /forget)
+# - integración con Ollama
+# - modos: dev/sec/latex/geo/chat/skip
+# =========================
+
+APP_NAME="ai"
+VERSION="1.4.0"
+
+# ---------- Config ----------
+AI_MODE_DEFAULT="${AI_MODE_DEFAULT:-dev}"
+AI_MODEL_DEFAULT="${AI_MODEL_DEFAULT:-llama3}"   # Ollama model name
+AI_SCOPE_DEFAULT="${AI_SCOPE_DEFAULT:-dev}"
+
+AI_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/${APP_NAME}"
+LOG_DIR="${AI_HOME}/logs"
+DB_PATH="${AI_HOME}/memory.sqlite"
+MODE_FILE="${AI_HOME}/mode"
+mkdir -p "$LOG_DIR"
+
+LOG_FILE="${LOG_DIR}/ai_$(date +%F).log"
+
+# ---------- Utils ----------
+ts() { date "+%F %T"; }
+log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE" >/dev/null; }
+
+die() { echo "✗ $*" >&2; log "ERROR: $*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+
+lower() { tr '[:upper:]' '[:lower:]'; }
+
+# ---------- State ----------
+MODE_SELECTED_ONCE=0
+MODE="$AI_MODE_DEFAULT"
+
+# ---------- DB (sqlite) ----------
+db_init() {
+  have sqlite3 || die "Falta sqlite3. Instala con: sudo apt-get install -y sqlite3"
+
+  # Crear tabla correcta (evita errores tipo 'no such column: k')
+  sqlite3 "$DB_PATH" <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS memory (
+  scope TEXT NOT NULL,
+  k     TEXT NOT NULL,
+  v     TEXT NOT NULL,
+  ts    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (scope, k)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_scope_ts ON memory(scope, ts DESC);
+SQL
+
+  # Migración suave si existía una tabla vieja incompatible (best-effort)
+  # Si falla, no detiene el script.
+  sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null || true
+-- Si existiera una tabla antigua sin columnas esperadas, esto no hará nada o fallará silencioso.
+SQL
+}
+
+db_set() {
+  local scope="$1" k="$2" v="$3"
+  sqlite3 "$DB_PATH" \
+    "INSERT INTO memory(scope,k,v,ts) VALUES(?,?,?,strftime('%s','now'))
+     ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v, ts=excluded.ts;" \
+     "$scope" "$k" "$v" >/dev/null
+}
+
+db_get() {
+  local scope="$1" k="$2"
+  sqlite3 -noheader -batch "$DB_PATH" \
+    "SELECT v FROM memory WHERE scope=? AND k=? LIMIT 1;" \
+    "$scope" "$k" 2>/dev/null || true
+}
+
+db_list() {
+  local scope="$1" limit="${2:-20}"
+  sqlite3 -noheader -batch "$DB_PATH" \
+    "SELECT datetime(ts,'unixepoch','localtime') || ' | ' || k || ' = ' || v
+     FROM memory WHERE scope=? ORDER BY ts DESC LIMIT ?;" \
+    "$scope" "$limit" 2>/dev/null || true
+}
+
+db_forget() {
+  local scope="$1" k="$2"
+  sqlite3 -noheader -batch "$DB_PATH" \
+    "DELETE FROM memory WHERE scope=? AND k=?;" \
+    "$scope" "$k" >/dev/null
+}
+
+# ---------- Mode selection (FIX: NO pregunta 2 veces) ----------
+select_mode_once() {
+  # Si ya fue seleccionado en esta ejecución → NO preguntar
+  if [[ "${MODE_SELECTED_ONCE}" -eq 1 ]]; then
+    return 0
+  fi
+
+  # Si hay modo persistido, usarlo directamente
+  if [[ -f "$MODE_FILE" ]]; then
+    MODE="$(<"$MODE_FILE")"
+    MODE="$(printf '%s' "$MODE" | lower)"
+    MODE="${MODE:-$AI_MODE_DEFAULT}"
+    MODE_SELECTED_ONCE=1
+    return 0
+  fi
+
+  # Si no hay TTY, usar default sin preguntar
+  if ! is_tty; then
+    MODE="$AI_MODE_DEFAULT"
+    printf '%s' "$MODE" >"$MODE_FILE"
+    MODE_SELECTED_ONCE=1
+    return 0
+  fi
+
+  # Preguntar SOLO una vez
+  while true; do
+    read -r -p "IA: ¿modo de apoyo? [dev/sec/latex/geo/chat/skip] (default: ${AI_MODE_DEFAULT}) > " MODE || true
+    MODE="$(printf '%s' "${MODE:-$AI_MODE_DEFAULT}" | lower)"
+
+    case "$MODE" in
+      dev|sec|latex|geo|chat|skip)
+        printf '%s' "$MODE" >"$MODE_FILE"
+        MODE_SELECTED_ONCE=1
+        break
+        ;;
+      *)
+        echo "Opción inválida."
+        ;;
+    esac
+  done
+}
+
+set_mode() {
+  local m
+  m="$(printf '%s' "${1:-}" | lower)"
+  case "$m" in
+    dev|sec|latex|geo|chat|skip)
+      MODE="$m"
+      printf '%s' "$MODE" >"$MODE_FILE"
+      MODE_SELECTED_ONCE=1
+      echo "✓ Modo actual: $MODE"
+      ;;
+    *)
+      echo "✗ Modo inválido: $m"
+      ;;
+  esac
+}
+
+# ---------- Ollama ----------
+need_ollama() {
+  have ollama || die "Falta 'ollama'. Instala (según tu sistema) y prueba: ollama --version"
+  # Si el daemon no corre, ollama usualmente lo levanta. Igual hacemos una prueba liviana.
+  ollama list >/dev/null 2>&1 || true
+}
+
+ollama_ask() {
+  local mode="$1" prompt="$2"
+  local model="${AI_MODEL_DEFAULT}"
+  local scope="${MODE}"
+
+  # Memoria como contexto (últimos N ítems)
+  local mem
+  mem="$(db_list "$scope" 15 | sed 's/|/•/g' || true)"
+
+  local sys=""
+  case "$mode" in
+    dev)   sys="Eres un asistente técnico. Responde en español neutro. Sé directo. Si entregas comandos, que sean concretos." ;;
+    sec)   sys="Eres un asistente de seguridad DEFENSIVA. Responde en español neutro. Prioriza hardening, diagnóstico y mitigación. No entregues pasos de explotación." ;;
+    latex) sys="Eres un asistente LaTeX. Responde en español neutro. Entrega .tex completo cuando corresponda." ;;
+    geo)   sys="Eres un asistente SIG/teledetección. Responde en español neutro. Da pasos claros y comandos/código cuando sirva." ;;
+    chat)  sys="Eres un asistente general. Responde en español neutro, breve y útil." ;;
+    *)     sys="Responde en español neutro, directo y útil." ;;
+  esac
+
+  local full
+  full=$(
+    cat <<EOF
+[SYSTEM]
+$sys
+
+[CONTEXTO LOCAL]
+Usuario: $(whoami)
+Host: $(hostname)
+Dir: $(pwd)
+
+[MEMORIA ($scope)]
+${mem:-"(vacía)"}
+
+[USUARIO]
+$prompt
+EOF
+  )
+
+  # Enviar prompt a Ollama (entrada por stdin)
+  printf '%s\n' "$full" | ollama run "$model" 2>/dev/null || {
+    echo "✗ Error ejecutando ollama run \"$model\""
+    return 1
+  }
+}
+
+# ---------- Allowlist executor (/do) ----------
+# Política:
+# - SOLO corre comandos explícitos o acciones mapeadas
+# - Nunca interpreta lenguaje natural como shell sin pasar por mapping/allowlist
+# - Si no está permitido: se rechaza
+ALLOW_CMDS=(
+  # Apps comunes
+  "evolution"
+  "firefox"
+  "google-chrome"
+  "chromium"
+  "nautilus"
+  "code"              # VSCode
+  "kitty"
+  "gnome-terminal"
+  "xdg-open"
+  "xdg-email"
+
+  # Sistema (lectura)
+  "uname -a"
+  "ls"
+  "pwd"
+  "whoami"
+  "id"
+  "ip a"
+  "ip r"
+  "ss -tulpn"
+  "df -h"
+  "free -h"
+  "uptime"
+  "journalctl -xe"
+  "systemctl status"
+  "systemctl --user status"
+
+  # Paquetes (sin auto-sudo)
+  "apt-cache policy"
+  "dpkg -l"
+  "snap list"
+
+  # LaTeX (compilación local)
+  "latexmk -pdf"
+  "pdflatex"
+
+  # Git (diario)
+  "git status"
+  "git diff"
+  "git log"
+  "git branch"
+  "git add"
+  "git commit"
+  "git push"
+  "git pull"
+
+  # Archivos
+  "mkdir"
+  "touch"
+  "rm"
+  "cp"
+  "mv"
+)
+
+# Acciones “humanas” -> comando concreto
+# (esto evita que tengas que escribir /do evolution etc.)
+resolve_action() {
+  local s
+  s="$(printf '%s' "$1" | lower | sed 's/[[:space:]]\+/ /g' | sed 's/^ *//;s/ *$//')"
+
+  case "$s" in
+    "abrir evolution"|"open evolution") echo "evolution" ;;
+    "abrir firefox"|"open firefox")     echo "firefox" ;;
+    "abrir chrome"|"open chrome"|"abrir google chrome") echo "google-chrome" ;;
+    "abrir archivos"|"open files"|"abrir nautilus") echo "nautilus" ;;
+    "ver red"|"red"|"network") echo "ip a" ;;
+    "ver puertos"|"puertos"|"ports") echo "ss -tulpn" ;;
+    "ver disco"|"disco"|"disk") echo "df -h" ;;
+    "ver memoria"|"memoria"|"ram") echo "free -h" ;;
+    *)
+      # Si ya viene como comando, devolver tal cual
+      echo "$1"
+      ;;
+  esac
+}
+
+# Check allowlist por prefijo exacto (safe)
+is_allowed() {
+  local cmd="$1"
+  local a
+  for a in "${ALLOW_CMDS[@]}"; do
+    # Permitimos coincidencia por prefijo exacto:
+    # ej: "mkdir" permite "mkdir -p X", "git add" permite "git add archivo"
+    if [[ "$cmd" == "$a" ]] || [[ "$cmd" == "$a "* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+do_exec() {
+  local raw="$*"
+  [[ -z "${raw// /}" ]] && { echo "✗ /do requiere una acción o comando"; return 1; }
+
+  # Resolver “acción humana” a comando
+  local cmd
+  cmd="$(resolve_action "$raw")"
+
+  # Sanitización básica: no permitimos encadenamientos peligrosos
+  # (puedes ampliar después, pero esto ya evita ; && || | ` $() > < etc.)
+  if [[ "$cmd" =~ [\;\&\|\`\<\>\$] ]] || [[ "$cmd" =~ \$\(|\)\) ]]; then
+    echo "✗ Rechazado: contiene operadores no permitidos"
+    return 1
+  fi
+
+  if ! is_allowed "$cmd"; then
+    echo "⚠ Acción no permitida/no reconocida: $raw"
+    echo "   Si quieres permitirla, agrégala a ALLOW_CMDS o crea un mapping en resolve_action()."
+    return 1
+  fi
+
+  echo "▶ Ejecutando: $cmd"
+  log "DO: $cmd"
+  # Ejecutar sin eval, usando bash -lc para respetar PATH pero sin interpretación extra
+  bash -lc "$cmd"
+  echo "✓ OK"
+}
+
+# ---------- Commands ----------
+show_help() {
+  cat <<EOF
+${APP_NAME} v${VERSION}  (modo: ${MODE})
+
+Comandos:
+  /help                     ayuda
+  /exit                     salir
+  /mode [dev|sec|latex|geo|chat|skip]  cambia modo
+  /ask <texto>              pregunta a la IA (sin ejecutar nada)
+  /do <acción|comando>      ejecuta (solo allowlist + mappings)
+  /remember <k> = <v>       guarda memoria en sqlite (scope = modo actual)
+  /mem [n]                  lista memoria (n por defecto 20)
+  /forget <k>               borra una clave de memoria
+
+Ejemplos:
+  /do abrir evolution
+  /do ver puertos
+  /remember backup_tool = rsync+hardlinks
+  /mem 10
+EOF
+}
+
+cmd_remember() {
+  local line="$*"
+  # formatos: "k = v" o "k=v"
+  if [[ "$line" != *"="* ]]; then
+    echo "✗ Uso: /remember clave = valor"
+    return 1
+  fi
+  local k v
+  k="$(printf '%s' "$line" | cut -d'=' -f1 | sed 's/^ *//;s/ *$//')"
+  v="$(printf '%s' "$line" | cut -d'=' -f2- | sed 's/^ *//;s/ *$//')"
+  [[ -z "$k" || -z "$v" ]] && { echo "✗ Clave/valor inválidos"; return 1; }
+  db_set "$MODE" "$k" "$v"
+  echo "✓ Guardado en memoria ($MODE): $k = $v"
+}
+
+cmd_mem() {
+  local n="${1:-20}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=20
+  local out
+  out="$(db_list "$MODE" "$n" || true)"
+  if [[ -z "${out// /}" ]]; then
+    echo "(memoria vacía para $MODE)"
+  else
+    echo "$out"
+  fi
+}
+
+cmd_forget() {
+  local k="${1:-}"
+  [[ -z "${k// /}" ]] && { echo "✗ Uso: /forget clave"; return 1; }
+  db_forget "$MODE" "$k"
+  echo "✓ Olvidado ($MODE): $k"
+}
+
+cmd_ask() {
+  local q="$*"
+  [[ -z "${q// /}" ]] && { echo "✗ Uso: /ask texto"; return 1; }
+  ollama_ask "$MODE" "$q" || true
+}
+
+# ---------- Main loop ----------
+main_loop() {
+  db_init
+  need_ollama
+
+  if [[ "$MODE" == "skip" ]]; then
+    exit 0
+  fi
+
+  echo "=== Contexto ==="
+  echo "Dir:  $(pwd)"
+  echo "Host: $(hostname)"
+  echo "User: $(whoami)"
+  echo "Shell: ${SHELL:-/bin/bash}"
+  echo
+  echo "Modo ${MODE^^}: sesión activa (escribe '/exit' para salir)"
+  echo "Atajos: /help /mode /ask /do /remember /mem /forget"
+  echo
+
+  while true; do
+    local line
+    read -r -p "IA(${MODE})> " line || { echo; break; }
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+
+    case "$line" in
+      /exit)
+        echo "Bye."
+        break
+        ;;
+      /help)
+        show_help
+        ;;
+      /mode\ *)
+        set_mode "${line#"/mode "}"
+        ;;
+      /mode)
+        echo "Modo actual: $MODE"
+        ;;
+      /ask\ *)
+        cmd_ask "${line#"/ask "}"
+        ;;
+      /do\ *)
+        do_exec "${line#"/do "}" || true
+        ;;
+      /remember\ *)
+        cmd_remember "${line#"/remember "}" || true
+        ;;
+      /mem\ *)
+        cmd_mem "${line#"/mem "}" || true
+        ;;
+      /mem)
+        cmd_mem 20 || true
+        ;;
+      /forget\ *)
+        cmd_forget "${line#"/forget "}" || true
+        ;;
+      *)
+        # Por defecto: responder con IA (sin ejecutar)
+        ollama_ask "$MODE" "$line" || true
+        ;;
+    esac
+  done
+}
+
+# ---------- Entrypoint ----------
+select_mode_once
+main_loop
